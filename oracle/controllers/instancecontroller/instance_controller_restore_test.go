@@ -10,6 +10,7 @@ import (
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -28,11 +29,12 @@ func testInstanceRestore() {
 		interval = time.Millisecond * 15
 	)
 	var (
-		Namespace    string
-		InstanceName string
-		BackupName   string
-		BackupID     string
-		ObjKey       client.ObjectKey
+		Namespace            string
+		CrossNamespacePrefix string
+		InstanceName         string
+		BackupName           string
+		BackupID             string
+		ObjKey               client.ObjectKey
 	)
 
 	var fakeDatabaseClient *testhelpers.FakeDatabaseClient
@@ -40,6 +42,7 @@ func testInstanceRestore() {
 
 	BeforeEach(func() {
 		Namespace = "default"
+		CrossNamespacePrefix = "cross-namespace-"
 		InstanceName = testhelpers.RandName("test-instance-restore")
 		BackupName = testhelpers.RandName("test-backup")
 		BackupID = testhelpers.RandName("test-backup-id")
@@ -67,6 +70,23 @@ func testInstanceRestore() {
 	ctx := context.Background()
 	restoreRequestTime := metav1.Now()
 
+	createNamespace := func(ctx context.Context, k8sClient client.Client, name string, crossNSLabel bool) {
+		// 1. Define the Namespace object
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name,
+			},
+		}
+
+		if crossNSLabel {
+			ns.ObjectMeta.Labels = map[string]string{
+				crossNSBackupRefAccessLabel: "true",
+			}
+		}
+
+		testhelpers.K8sCreateWithRetry(k8sClient, ctx, ns)
+	}
+
 	createInstanceAndStartRestore := func(mode testhelpers.FakeOperationStatus) (*v1alpha1.Instance, *v1alpha1.Backup) {
 		instance := createSimpleInstance(ctx, InstanceName, Namespace, timeout, interval)
 		backup := createSimpleRMANBackup(ctx, InstanceName, BackupName, BackupID, Namespace)
@@ -81,6 +101,36 @@ func testInstanceRestore() {
 			}
 			instance.Spec.Restore = &v1alpha1.RestoreSpec{
 				BackupID:    BackupID,
+				BackupType:  "Physical",
+				Force:       true,
+				RequestTime: restoreRequestTime,
+			}
+			return k8sClient.Update(ctx, instance)
+		})).Should(Succeed())
+
+		return instance, backup
+	}
+
+	createInstanceAndStartRestoreWithBackupRef := func(mode testhelpers.FakeOperationStatus, backupNS string) (*v1alpha1.Instance, *v1alpha1.Backup) {
+		instance := createSimpleInstance(ctx, InstanceName, Namespace, timeout, interval)
+		var backup *v1alpha1.Backup
+		if backupNS != "" {
+			backup = createSimpleRMANBackup(ctx, InstanceName, BackupName, BackupID, backupNS)
+
+		}
+		By("invoking RMAN restore for the Instance with backupRef")
+
+		// configure fakeDatabaseClient to be in requested mode
+		fakeDatabaseClient.SetNextGetOperationStatus(mode)
+		Expect(retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
+				return err
+			}
+			instance.Spec.Restore = &v1alpha1.RestoreSpec{
+				BackupRef: &v1alpha1.BackupReference{
+					Namespace: backupNS,
+					Name:      BackupName,
+				},
 				BackupType:  "Physical",
 				Force:       true,
 				RequestTime: restoreRequestTime,
@@ -404,6 +454,164 @@ func testInstanceRestore() {
 
 		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, ObjKey, instance)
 		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: BackupName}, backup)
+	})
+
+	It("it should restore successfully with backupRef of the same namespace", func() {
+		fakeDatabaseClient.SetAsyncPhysicalRestore(false)
+		instance, backup := createInstanceAndStartRestoreWithBackupRef(testhelpers.StatusDone, Namespace)
+
+		By("checking that instance status is Ready")
+		Eventually(func() (metav1.ConditionStatus, error) {
+			return getConditionStatus(ctx, ObjKey, k8s.Ready)
+		}, timeout, interval).Should(Equal(metav1.ConditionTrue))
+
+		Expect(fakeDatabaseClient.DeleteOperationCalledCnt()).Should(Equal(0))
+
+		By("checking that instance Restore section is deleted")
+		Eventually(func() error {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
+				return err
+			}
+			if instance.Spec.Restore != nil {
+				return fmt.Errorf("expected update has not yet happened")
+			}
+			return nil
+		}, timeout, interval).Should(Succeed())
+
+		By("checking that instance Status.Description is updated")
+		Eventually(func() error {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
+				return err
+			}
+			if !strings.HasPrefix(instance.Status.Description, "Restored on") {
+				return fmt.Errorf("%q does not have expected prefix", instance.Status.Description)
+			}
+			return nil
+		}, timeout, interval).Should(Succeed())
+
+		By("checking that instance maintenance lock is released")
+		// Instance object should be fresh at this point, no need to retry
+		Expect(instance.Status.LockedByController).Should(Equal(""))
+
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, ObjKey, instance)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: BackupName}, backup)
+	})
+
+	It("it should restore fail with cross-namespace backupRef if the cross-namespace backupRef specifies a namespace that does not exist.", func() {
+		fakeDatabaseClient.SetAsyncPhysicalRestore(false)
+		instance, _ := createInstanceAndStartRestoreWithBackupRef(testhelpers.StatusDone, "")
+
+		By("checking that instance Restore section is deleted")
+		Eventually(func() error {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
+				return err
+			}
+			if instance.Spec.Restore != nil {
+				return fmt.Errorf("expected update has not yet happened")
+			}
+			return nil
+		}, timeout, interval).Should(Succeed())
+
+		By("checking that instance Status.Description is updated")
+		Eventually(func() error {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
+				return err
+			}
+			cond := k8s.FindCondition(instance.Status.Conditions, k8s.Ready)
+			if !strings.HasPrefix(cond.Message, "Could not find a matching backup") {
+				return fmt.Errorf("%q does not have expected prefix in the condition", cond.Message)
+			}
+			return nil
+		}, timeout, interval).Should(Succeed())
+
+		By("checking that instance maintenance lock is released")
+		// Instance object should be fresh at this point, no need to retry
+		Expect(instance.Status.LockedByController).Should(Equal(""))
+
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, ObjKey, instance)
+	})
+
+	It("it should restore fail with cross-namespace backupRef without cross-namespace backupRef access label", func() {
+		fakeDatabaseClient.SetAsyncPhysicalRestore(false)
+		// Create a different namespace
+		crossNS := CrossNamespacePrefix + "1"
+		createNamespace(ctx, k8sClient, crossNS, false)
+
+		instance, backup := createInstanceAndStartRestoreWithBackupRef(testhelpers.StatusDone, crossNS)
+
+		By("checking that instance Restore section is deleted")
+		Eventually(func() error {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
+				return err
+			}
+			if instance.Spec.Restore != nil {
+				return fmt.Errorf("expected update has not yet happened")
+			}
+			return nil
+		}, timeout, interval).Should(Succeed())
+
+		By("checking that instance Status.Description is updated")
+		Eventually(func() error {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
+				return err
+			}
+			cond := k8s.FindCondition(instance.Status.Conditions, k8s.Ready)
+			if !strings.HasPrefix(cond.Message, "Could not find a matching backup") {
+				return fmt.Errorf("%q does not have expected prefix in the condition", cond.Message)
+			}
+			return nil
+		}, timeout, interval).Should(Succeed())
+
+		By("checking that instance maintenance lock is released")
+		// Instance object should be fresh at this point, no need to retry
+		Expect(instance.Status.LockedByController).Should(Equal(""))
+
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, ObjKey, instance)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: crossNS, Name: BackupName}, backup)
+	})
+
+	It("it should restore successfully with cross-namespace backupRef if the cross namespace is labeled with allow-cross-namespace-backup-reference", func() {
+		fakeDatabaseClient.SetAsyncPhysicalRestore(false)
+		// Create a different namespace
+		crossNS := CrossNamespacePrefix + "2"
+		createNamespace(ctx, k8sClient, crossNS, true)
+
+		instance, backup := createInstanceAndStartRestoreWithBackupRef(testhelpers.StatusDone, crossNS)
+		By("checking that instance status is Ready")
+		Eventually(func() (metav1.ConditionStatus, error) {
+			return getConditionStatus(ctx, ObjKey, k8s.Ready)
+		}, timeout, interval).Should(Equal(metav1.ConditionTrue))
+
+		Expect(fakeDatabaseClient.DeleteOperationCalledCnt()).Should(Equal(0))
+
+		By("checking that instance Restore section is deleted")
+		Eventually(func() error {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
+				return err
+			}
+			if instance.Spec.Restore != nil {
+				return fmt.Errorf("expected update has not yet happened")
+			}
+			return nil
+		}, timeout, interval).Should(Succeed())
+
+		By("checking that instance Status.Description is updated")
+		Eventually(func() error {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
+				return err
+			}
+			if !strings.HasPrefix(instance.Status.Description, "Restored on") {
+				return fmt.Errorf("%q does not have expected prefix", instance.Status.Description)
+			}
+			return nil
+		}, timeout, interval).Should(Succeed())
+
+		By("checking that instance maintenance lock is released")
+		// Instance object should be fresh at this point, no need to retry
+		Expect(instance.Status.LockedByController).Should(Equal(""))
+
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, ObjKey, instance)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: crossNS, Name: BackupName}, backup)
 	})
 }
 

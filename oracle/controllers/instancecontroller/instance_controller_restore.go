@@ -37,6 +37,8 @@ import (
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s"
 )
 
+const crossNSBackupRefAccessLabel = "allow-cross-namespace-backup-reference"
+
 // Reconciler for restore logic.
 // Invoked when Spec.Restore is present.
 // State transition:
@@ -389,6 +391,15 @@ func (r *InstanceReconciler) findBackupForRestore(ctx context.Context, inst v1al
 		if inst.Spec.Restore.BackupID != "" || inst.Spec.Restore.PITRRestore != nil {
 			return nil, fmt.Errorf("preflight check: specify only one of BackupID/BackupRef/PITRRestore")
 		}
+
+		/*
+			For cross-namespace backup requests, ensure the target namespace permits
+			cross-namespace references; otherwise, fail the request and set the status condition to False
+		*/
+		if err := r.checkCrossNSPermission(ctx, inst); err != nil {
+			return nil, err
+		}
+
 		// find backup based on BackupRef
 		if err := r.Get(ctx, types.NamespacedName{Name: backupRef.Name, Namespace: backupRef.Namespace}, &backup); err != nil {
 			return nil, fmt.Errorf("preflight check: failed to get backup for a restore: %v, backupRef: %v", err, backupRef)
@@ -423,6 +434,24 @@ func (r *InstanceReconciler) findBackupForRestore(ctx context.Context, inst v1al
 	}
 
 	return &backup, nil
+}
+
+func (r *InstanceReconciler) checkCrossNSPermission(ctx context.Context, inst v1alpha1.Instance) error {
+	if inst.Namespace == inst.Spec.Restore.BackupRef.Namespace {
+		return nil
+	}
+
+	namespace := inst.Spec.Restore.BackupRef.Namespace
+	ns := &corev1.Namespace{}
+	if err := r.Client.Get(ctx, types.NamespacedName{Name: namespace}, ns); err != nil {
+		return fmt.Errorf("failed to get namespace %q: %w", namespace, err)
+
+	}
+
+	if val, ok := ns.Labels[crossNSBackupRefAccessLabel]; !ok || val != "true" {
+		return fmt.Errorf("namespace %q does not allow cross-namespace backup references (label '%s' must be set to 'true')", namespace, crossNSBackupRefAccessLabel)
+	}
+	return nil
 }
 
 // restorePhysical runs the pre-flight checks and if all is good
